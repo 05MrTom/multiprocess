@@ -19,18 +19,38 @@ import tensorrt as trt
 import matplotlib.pyplot as plt
 import cv2
 
-from PIL import Image
-import torchvision.transforms as transforms
+# from PIL import Image
+# import torchvision.transforms as transforms
 import time
 from contextlib import contextmanager
 import contextlib
 
 
+# # Configure logger
+# LOGGER = logging.getLogger("TensorRTInference")
+# LOGGER.setLevel(logging.INFO)
+# logging.basicConfig(level=logging.INFO)
+
 # Configure logger
 LOGGER = logging.getLogger("TensorRTInference")
 LOGGER.setLevel(logging.INFO)
-logging.basicConfig(level=logging.INFO)
 
+# Create file handler
+file_handler = logging.FileHandler("app.log")
+file_handler.setLevel(logging.INFO)
+
+# Create console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Define log format
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers to logger
+LOGGER.addHandler(file_handler)
+LOGGER.addHandler(console_handler)
 
 @contextmanager
 def timer(name=""):
@@ -315,94 +335,125 @@ def pose_nms(
     # Convert bounding boxes from (x, y, w, h) to (x1, y1, x2, y2)
     prediction[..., :4] = xywh2xyxy(prediction[..., :4])
     output = []
-    with timer("NMS"):
-        for pred in prediction:
-            # Filter out detections below confidence threshold
-            with timer("NMS empty pred"):
-                pred = pred[pred[:, 4] > conf_thres]
-            if pred.shape[0] == 0:
-                output.append(torch.empty((0, 56), device=pred.device))
-                continue
+    for pred in prediction:
+        # Filter out detections below confidence threshold
+        pred = pred[pred[:, 4] > conf_thres]
+        if pred.shape[0] == 0:
+            output.append(torch.empty((0, 56), device=pred.device))
+            continue
 
-            # Limit to top candidates to reduce NMS computation
-            with timer("NMS topk"):
-                if pred.shape[0] > pre_nms_topk:
-                    scores = pred[:, 4]
-                    _, idx = scores.topk(pre_nms_topk)
-                    pred = pred[idx]
-                boxes = pred[:, :4]
-                scores = pred[:, 4]
-            with timer("NMS nms"):
-                keep = torchvision.ops.nms(boxes, scores, iou_thres)
-            with timer("NMS post-nms"):
-                keep = keep[:max_det]  # Cap detections per image
-                output.append(pred[keep])
-        return output
+        # Limit to top candidates to reduce NMS computation
+        if pred.shape[0] > pre_nms_topk:
+            scores = pred[:, 4]
+            _, idx = scores.topk(pre_nms_topk)
+            pred = pred[idx]
+        boxes = pred[:, :4]
+        scores = pred[:, 4]
+        keep = torchvision.ops.nms(boxes, scores, iou_thres)
+        keep = keep[:max_det]  # Cap detections per image
+        output.append(pred[keep])
+    return output
 
 
 if __name__ == "__main__":
     # For demonstration, engine and image paths are hardcoded.
-    engine = TensorRTInferenceEngine("/home/amrit05/projects/shuttlengine/yolo11n-pose.engine")
+    engine = TensorRTInferenceEngine("/home/amrit05/projects/shuttlengine/yolo11s-pose.engine")
     device = (torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
     profilers = (
                 Profile(device=device),
                 Profile(device=device),
                 Profile(device=device),
             )
-    with profilers[0]:
-        with timer("Warmup"):
-            orig_image = Image.open("test.png").convert('RGB')
-            # orig_img_shape is (height, width)
-            orig_img_shape = orig_image.size[::-1]
+   # Placeholder for video path
+    video_path = "/home/amrit05/.posedetection/2023-viktor-prannoy/rally_101047_101584.mp4"
+    # Lists to store processing times
+    frame_times = []
+    preprocess_times = []
+    inference_times = []
+    postprocess_times = []
 
-            input_tensor = transforms.Compose([
-                transforms.Resize((640, 640)),  # Forced resize (warping)
-                transforms.ToTensor(),
-            ])(orig_image).unsqueeze(0).to(engine.device)
-    with profilers[1]:
-        with timer("Inference"):
-            output_tensor = engine.infer_async_v3(input_tensor)[0]
-        print("Shape after inference:", output_tensor.shape)
-    with profilers[2]:
-        # Transpose to shape (batch, num_detections, detection_size)
-        output_tensor = output_tensor.permute(0, 2, 1)
-        print("Shape after transpose:", output_tensor.shape)
+    # Open video capture
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        exit()
 
-        with timer("Pose NMS"):
-            preds_nms = pose_nms(output_tensor, conf_thres=0.25, iou_thres=0.45, max_det=300, pre_nms_topk=1000)[0]
-        print("Shape after Pose NMS:", preds_nms.shape)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break  # End of video
+        with timer("Frame Processing") as frame_time:
+            with profilers[0]:
+                # with timer("Preprocessing") as preprocess_time:
+                    # orig_img_shape = frame.shape[:2]  # (height, width)
+                    # image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    # input_tensor = transforms.Compose([
+                    #     transforms.Resize((640, 640)),
+                    #     transforms.ToTensor(),
+                    # ])(image).unsqueeze(0).to(engine.device)
+                with timer("Preprocessing") as preprocess_time:
+                    orig_img_shape = frame.shape[:2]  # (height, width)
+                    # Resize directly using OpenCV (optimized in C++)
+                    resized_frame = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
+                    # Convert from BGR to RGB
+                    rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+                    # Convert to a tensor: change shape from HxWxC to CxHxW and scale to [0,1]
+                    input_tensor = (
+                        torch.from_numpy(rgb_frame)
+                        .permute(2, 0, 1)
+                        .unsqueeze(0)
+                        .float()
+                        .div(255.0)
+                        .to(engine.device)
+                    )
+                    
+            # Run inference
+            with profilers[1]:
+                with timer("Inference") as inference_time:
+                    output_tensor = engine.infer_async_v3(input_tensor)[0]
 
-        if preds_nms is not None and preds_nms.shape[0]:
-            with timer("Postprocess"):
-                # Since the image was resized to 640x640, compute scaling factors.
-                target_size = 640  # both height and width
-                scale_x = orig_img_shape[1] / target_size  # orig width / 640
-                scale_y = orig_img_shape[0] / target_size  # orig height / 640
+            # Post-processing
+            with profilers[2]:
+                with timer("Post-processing") as postprocess_time:
+                    output_tensor = output_tensor.permute(0, 2, 1)
+                    preds_nms = pose_nms(output_tensor, conf_thres=0.25, iou_thres=0.45, max_det=300, pre_nms_topk=1000)[0]
+                    if preds_nms is not None and preds_nms.shape[0]:
+                        scale_x = orig_img_shape[1] / 640
+                        scale_y = orig_img_shape[0] / 640
 
-                # Process bounding boxes on GPU
-                boxes = preds_nms[:, :4]
-                boxes[:, [0, 2]] *= scale_x
-                boxes[:, [1, 3]] *= scale_y
+                        boxes = preds_nms[:, :4]
+                        boxes[:, [0, 2]] *= scale_x
+                        boxes[:, [1, 3]] *= scale_y
 
-                # Process keypoints: reshape and scale on GPU
-                keypoints = preds_nms[:, 5:].reshape(-1, 17, 3)
-                keypoints[..., 0] *= scale_x
-                keypoints[..., 1] *= scale_y
+                        keypoints = preds_nms[:, 5:].reshape(-1, 17, 3)
+                        keypoints[..., 0] *= scale_x
+                        keypoints[..., 1] *= scale_y
 
-            # Convert to NumPy for visualization
-            boxes_np = boxes.cpu().numpy()
-            keypoints_np = keypoints.cpu().numpy()
+                        boxes_np = boxes.cpu().numpy()
+                        keypoints_np = keypoints.cpu().numpy()
 
-            vis_img = cv2.cvtColor(np.array(orig_image), cv2.COLOR_RGB2BGR)
-            for box, kpts in zip(boxes_np, keypoints_np):
-                x1, y1, x2, y2 = box.astype(int)
-                cv2.rectangle(vis_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                for (x, y, kp_conf) in kpts:
-                    if kp_conf > 0.25:
-                        cv2.circle(vis_img, (int(x), int(y)), 3, (0, 0, 255), -1)
-            plt.imshow(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title("YOLO Pose: Boxes and Keypoints")
-            plt.show()
-        else:
-            print("No detections found after NMS.")
+                #     for box, kpts in zip(boxes_np, keypoints_np):
+                #         x1, y1, x2, y2 = box.astype(int)
+                #         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                #         for (x, y, kp_conf) in kpts:
+                #             if kp_conf > 0.25:
+                #                 cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
+
+                # cv2.imshow("YOLO Pose Inference", frame)
+                # if cv2.waitKey(1) & 0xFF == ord('q'):
+                #     break
+        
+        frame_times.append(frame_time())
+        preprocess_times.append(preprocess_time())
+        inference_times.append(inference_time())
+        postprocess_times.append(postprocess_time())
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if frame_times:
+        print(f"Avg. Preprocessing Time: {sum(preprocess_times) / len(preprocess_times):.2f} ms")
+        print(f"Avg. Inference Time: {sum(inference_times) / len(inference_times):.2f} ms")
+        print(f"Avg. Post-processing Time: {sum(postprocess_times) / len(postprocess_times):.2f} ms")
+        print(f"Avg. Total Time: {sum(frame_times) / len(frame_times):.2f} ms")
+        print(f"FPS: {1000 / (sum(frame_times) / len(frame_times)):.2f}")
