@@ -138,7 +138,7 @@ class TensorRTInferenceEngine:
         self.bindings = OrderedDict()  # Mapping from binding name to Binding tuple.
         self.output_names = []
         self.dynamic = False
-        self.fp16 = False
+        self.fp16 = True
         # For TRT10, is_trt10 is always True.
         self._load_engine()
 
@@ -357,7 +357,7 @@ def pose_nms(
 
 if __name__ == "__main__":
     # For demonstration, engine and image paths are hardcoded.
-    engine = TensorRTInferenceEngine("/home/amrit05/projects/shuttlengine/yolo11s-pose.engine")
+    engine = TensorRTInferenceEngine("/home/amrit05/projects/shuttlengine/yolo11m-pose.engine")
     device = (torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
     profilers = (
                 Profile(device=device),
