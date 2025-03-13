@@ -24,13 +24,33 @@ import torchvision.transforms as transforms
 import time
 from contextlib import contextmanager
 import contextlib
+import torch.nn.functional as F
 
+# # Configure logger
+# LOGGER = logging.getLogger("TensorRTInference")
+# LOGGER.setLevel(logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 
 # Configure logger
 LOGGER = logging.getLogger("TensorRTInference")
 LOGGER.setLevel(logging.INFO)
-logging.basicConfig(level=logging.INFO)
 
+# Create file handler
+file_handler = logging.FileHandler("app.log")
+file_handler.setLevel(logging.INFO)
+
+# Create console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Define log format
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers to logger
+LOGGER.addHandler(file_handler)
+LOGGER.addHandler(console_handler)
 
 @contextmanager
 def timer(name=""):
@@ -118,7 +138,7 @@ class TensorRTInferenceEngine:
         self.bindings = OrderedDict()  # Mapping from binding name to Binding tuple.
         self.output_names = []
         self.dynamic = False
-        self.fp16 = True
+        self.fp16 = False
         # For TRT10, is_trt10 is always True.
         self._load_engine()
 
@@ -319,8 +339,7 @@ def pose_nms(
         # Filter out detections below confidence threshold
         pred = pred[pred[:, 4] > conf_thres]
         if pred.shape[0] == 0:
-            with timer("empty"):
-                output.append(torch.empty((0, 56), device=pred.device))
+            output.append(torch.empty((0, 56), device=pred.device))
             continue
 
         # Limit to top candidates to reduce NMS computation
@@ -330,8 +349,7 @@ def pose_nms(
             pred = pred[idx]
         boxes = pred[:, :4]
         scores = pred[:, 4]
-        with timer("NMS"):
-            keep = torchvision.ops.nms(boxes, scores, iou_thres)
+        keep = torchvision.ops.nms(boxes, scores, iou_thres)
         keep = keep[:max_det]  # Cap detections per image
         output.append(pred[keep])
     return output
@@ -339,7 +357,7 @@ def pose_nms(
 
 if __name__ == "__main__":
     # For demonstration, engine and image paths are hardcoded.
-    engine = TensorRTInferenceEngine("/home/amrit05/projects/shuttlengine/yolo11m-pose.engine")
+    engine = TensorRTInferenceEngine("/home/amrit05/projects/shuttlengine/yolo11s-pose.engine")
     device = (torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
     profilers = (
                 Profile(device=device),
@@ -366,13 +384,50 @@ if __name__ == "__main__":
             break  # End of video
         with timer("Frame Processing") as frame_time:
             with profilers[0]:
+                # with timer("Preprocessing") as preprocess_time:
+                #     with timer("frame shape"):
+                #         orig_img_shape = frame.shape[:2]  # (height, width)
+                #     with timer("Image from array"):
+                #         image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                #     with timer("Transform"):
+                #         input_tensor = transforms.Compose([
+                #             transforms.Resize((640, 640)),
+                #             transforms.ToTensor(),
+                #         ])(image).unsqueeze(0).to(engine.device)
                 with timer("Preprocessing") as preprocess_time:
-                    orig_img_shape = frame.shape[:2]  # (height, width)
-                    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    input_tensor = transforms.Compose([
-                        transforms.Resize((640, 640)),
-                        transforms.ToTensor(),
-                    ])(image).unsqueeze(0).to(engine.device)
+                    with timer("frame shape"):
+                        orig_img_shape = frame.shape[:2]  # (height, width)
+                    
+                    # Resize using OpenCV
+                    with timer("Resize"):
+                        resized_frame = cv2.resize(frame, (640, 640))
+                    
+                    # Convert to tensor
+                    with timer("Image from array and Transform"):
+                        image = Image.fromarray(cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB))
+                        input_tensor = transforms.ToTensor()(image).unsqueeze(0).to(engine.device)
+                # with timer("Preprocessing") as preprocess_time:
+                #     orig_img_shape = frame.shape[:2]  # (height, width)
+                #     # Convert BGR to RGB
+                #     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                #     # Resize directly using OpenCV
+                #     frame_resized = cv2.resize(frame_rgb, (640, 640), interpolation=cv2.INTER_AREA)
+                #     # Convert the NumPy array to a torch tensor and normalize
+                #     input_tensor = torch.from_numpy(frame_resized).permute(2, 0, 1).float().div(255.0)
+                #     input_tensor = input_tensor.unsqueeze(0).to(engine.device)
+                # print(f"Input tensor shape: {input_tensor.shape}")
+
+                
+                # with timer("Preprocessing") as preprocess_time:
+                #     orig_img_shape = frame.shape[:2]  # (height, width)
+                #     # Convert BGR to RGB using OpenCV
+                #     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                #     # Convert to torch tensor and reformat to (B, C, H, W)
+                #     tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().unsqueeze(0).div(255.0)
+                #     # Resize on GPU using bilinear interpolation with antialiasing (if supported)
+                #     input_tensor = F.interpolate(
+                #         tensor, size=(640, 640), mode='bilinear', align_corners=False, antialias=True
+                #     ).to(engine.device)          
 
             # Run inference
             with profilers[1]:
@@ -384,6 +439,7 @@ if __name__ == "__main__":
                 with timer("Post-processing") as postprocess_time:
                     output_tensor = output_tensor.permute(0, 2, 1)
                     preds_nms = pose_nms(output_tensor, conf_thres=0.25, iou_thres=0.45, max_det=300, pre_nms_topk=1000)[0]
+                    print(f"preds_nms shape : {preds_nms.shape}")
                     if preds_nms is not None and preds_nms.shape[0]:
                         scale_x = orig_img_shape[1] / 640
                         scale_y = orig_img_shape[0] / 640
@@ -395,20 +451,24 @@ if __name__ == "__main__":
                         keypoints = preds_nms[:, 5:].reshape(-1, 17, 3)
                         keypoints[..., 0] *= scale_x
                         keypoints[..., 1] *= scale_y
-
+                        LOGGER.info(f"Detected {keypoints.shape[0]} poses.")
                         boxes_np = boxes.cpu().numpy()
                         keypoints_np = keypoints.cpu().numpy()
+                        print(f"type of boxes_np : {type(boxes_np)}")
+                        print(f"type of keypoints_np : {type(keypoints_np)}")
+                        print(f"shape of boxes_np : {boxes_np.shape}")
+                        print(f"shape of keypoints_np : {keypoints_np.shape}")
 
-                for box, kpts in zip(boxes_np, keypoints_np):
-                    x1, y1, x2, y2 = box.astype(int)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    for (x, y, kp_conf) in kpts:
-                        if kp_conf > 0.25:
-                            cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
+                    #     for box, kpts in zip(boxes_np, keypoints_np):
+                    #         x1, y1, x2, y2 = box.astype(int)
+                    #         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    #         for (x, y, kp_conf) in kpts:
+                    #             if kp_conf > 0.25:
+                    #                 cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
 
-            cv2.imshow("YOLO Pose Inference", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                    # cv2.imshow("YOLO Pose Inference", frame)
+                    # if cv2.waitKey(1) & 0xFF == ord('q'):
+                    #     break
             
         frame_times.append(frame_time())
         preprocess_times.append(preprocess_time())
@@ -423,3 +483,4 @@ if __name__ == "__main__":
         print(f"Avg. Inference Time: {sum(inference_times) / len(inference_times):.2f} ms")
         print(f"Avg. Post-processing Time: {sum(postprocess_times) / len(postprocess_times):.2f} ms")
         print(f"Avg. Total Time: {sum(frame_times) / len(frame_times):.2f} ms")
+        print(f"FPS: {1000 / (sum(frame_times) / len(frame_times)):.2f}")
